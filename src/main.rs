@@ -51,6 +51,25 @@ enum VersionStage {
     Release,
 }
 
+impl PartialOrd for VersionStage {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VersionStage {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use VersionStage::*;
+        match (self, other) {
+            (Alpha, Alpha) | (Beta, Beta) | (Release, Release) => std::cmp::Ordering::Equal,
+            (Alpha, _) => std::cmp::Ordering::Less,
+            (Beta, Alpha) => std::cmp::Ordering::Greater,
+            (Beta, Release) => std::cmp::Ordering::Less,
+            (Release, _) => std::cmp::Ordering::Greater,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Version {
     major: u32,
@@ -58,6 +77,23 @@ struct Version {
     patch: u32,
     stage: VersionStage,
     build: u32,
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.major
+            .cmp(&other.major)
+            .then(self.minor.cmp(&other.minor))
+            .then(self.patch.cmp(&other.patch))
+            .then(self.stage.cmp(&other.stage))
+            .then(self.build.cmp(&other.build))
+    }
 }
 
 impl std::str::FromStr for Version {
@@ -102,14 +138,6 @@ impl std::str::FromStr for Version {
                 0
             };
             (stage, build)
-        } else if parts.len() == 2 {
-            let stage = match parts[1] {
-                "alpha" => VersionStage::Alpha,
-                "beta" => VersionStage::Beta,
-                "release" => VersionStage::Release,
-                _ => return Err("Invalid version stage".to_string()),
-            };
-            (stage, 0)
         } else {
             (VersionStage::Release, 0)
         };
@@ -185,13 +213,8 @@ struct Launcher {
     versions: HashSet<Version>,
     input_version_content: String,
     input_game_dir_content: String,
+    version_downloading: bool,
     view: View,
-}
-
-impl Default for Launcher {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Launcher {
@@ -221,6 +244,7 @@ impl Launcher {
             versions: HashSet::new(),
             input_version_content: String::new(),
             input_game_dir_content: game_dir.to_string_lossy().to_string(),
+            version_downloading: false,
             view: View::Main,
         };
 
@@ -410,6 +434,7 @@ impl Launcher {
                         if self.versions.contains(&version) {
                             return Task::none();
                         }
+                        self.version_downloading = true;
                         Task::perform(
                             Self::download_version(
                                 self.launcher_settings.game_dir.clone(),
@@ -499,6 +524,7 @@ impl Launcher {
             },
             Message::VersionDownloaded(version) => {
                 self.versions.insert(version);
+                self.version_downloading = false;
                 let versions_str: HashSet<String> =
                     self.versions.iter().map(|v| v.to_string()).collect();
                 let versions_data = serde_json::to_string_pretty(&versions_str)
@@ -522,7 +548,9 @@ impl Launcher {
 
     fn main_view(&self) -> iced::Element<'_, Message> {
         let mut installed_versions = Column::new();
-        let versions: Vec<&Version> = self.versions.iter().collect();
+        let mut versions: Vec<Version> = self.versions.iter().copied().collect();
+        versions.sort();
+        versions.reverse();
         let mut dark = false;
         for version in versions {
             installed_versions = installed_versions.push(
@@ -628,7 +656,7 @@ impl Launcher {
 }
 
 fn main() -> iced::Result {
-    iced::application(Launcher::default, Launcher::update, Launcher::view)
+    iced::application(Launcher::new, Launcher::update, Launcher::view)
         .theme(iced::theme::Theme::CatppuccinMocha)
         .default_font(iced::Font::MONOSPACE)
         .run()
