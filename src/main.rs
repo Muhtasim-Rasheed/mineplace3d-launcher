@@ -102,7 +102,7 @@ impl std::str::FromStr for Version {
                 0
             };
             (stage, build)
-        } else if parts.len() == 1 {
+        } else if parts.len() == 2 {
             let stage = match parts[1] {
                 "alpha" => VersionStage::Alpha,
                 "beta" => VersionStage::Beta,
