@@ -287,6 +287,24 @@ impl Launcher {
             return Err(format!("Version v{} is not available", version));
         }
 
+        if !Self::check_sdl2() {
+            #[cfg(target_os = "windows")]
+            return Err(format!(
+                "SDL2 library is not installed. Please put the correct SDL2.dll depending on your architecture into {} to run the game.",
+                self.launcher_settings.game_dir.join("versions").display()
+            ));
+            #[cfg(target_os = "linux")]
+            return Err("SDL2 library is not installed. Please install sdl2-compat using your package manager to run the game.".to_string());
+            // The SDL2 framework would be added with the macOS app bundle anyways.
+        }
+
+        #[cfg(target_os = "linux")]
+        let exec_path = self
+            .launcher_settings
+            .game_dir
+            .join("versions")
+            .join(version.to_string());
+
         #[cfg(target_os = "windows")]
         let exec_path = self
             .launcher_settings
@@ -294,14 +312,27 @@ impl Launcher {
             .join("versions")
             .join(format!("{}.exe", version));
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         let exec_path = self
             .launcher_settings
             .game_dir
             .join("versions")
-            .join(version.to_string());
+            .join(format!("{}.app", version));
 
+        #[cfg(not(target_os = "macos"))]
         std::process::Command::new(&exec_path)
+            .env("MINEPLACE3D_GAME_DIR", &self.launcher_settings.game_dir)
+            .spawn()
+            .map_err(|e| {
+                format!(
+                    "Failed to launch version v{} at {:?}: {}",
+                    version, exec_path, e
+                )
+            })?;
+
+        #[cfg(target_os = "macos")]
+        std::process::Command::new("open")
+            .arg(&exec_path)
             .env("MINEPLACE3D_GAME_DIR", &self.launcher_settings.game_dir)
             .spawn()
             .map_err(|e| {
@@ -365,6 +396,8 @@ impl Launcher {
                         arch,
                         if cfg!(target_os = "windows") {
                             ".exe"
+                        } else if cfg!(target_os = "macos") {
+                            ".app"
                         } else {
                             ""
                         }
@@ -398,6 +431,8 @@ impl Launcher {
             .join("versions")
             .join(if cfg!(target_os = "windows") {
                 format!("{}.exe", version)
+            } else if cfg!(target_os = "macos") {
+                format!("{}.app", version)
             } else {
                 version.to_string()
             });
@@ -406,6 +441,100 @@ impl Launcher {
 
         std::fs::write(&exec_path, &binary_data)
             .map_err(|e| format!("Failed to write executable for version v{}: {}", version, e))?;
+
+        // Are we on windows on x64? If so, install SDL2.dll if not present
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            let sdl2_path = game_dir.join("versions").join("SDL2.dll");
+            if !sdl2_path.exists() {
+                let sdl2_url = "https://www.libsdl.org/release/SDL2-2.0.14-win32-x64.zip";
+                let sdl2_response = client
+                    .get(sdl2_url)
+                    .header("User-Agent", "mineplace3d-launcher")
+                    .send()
+                    .await
+                    .map_err(|e| format!("Failed to download SDL2.dll: {}", e))?;
+
+                if !sdl2_response.status().is_success() {
+                    return Err("Failed to download SDL2.dll".to_string());
+                }
+
+                let sdl2_data = sdl2_response
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("Failed to read SDL2.dll data: {}", e))?;
+
+                let temp_zip_path = game_dir.join("versions").join("sdl2_temp.zip");
+                std::fs::write(&temp_zip_path, &sdl2_data)
+                    .map_err(|e| format!("Failed to write SDL2.dll zip file: {}", e))?;
+
+                let mut zip = zip::ZipArchive::new(
+                    std::fs::File::open(&temp_zip_path)
+                        .map_err(|e| format!("Failed to open SDL2.dll zip file: {}", e))?,
+                )
+                .map_err(|e| format!("Failed to read SDL2.dll zip archive: {}", e))?;
+
+                let mut sdl2_file = zip
+                    .by_name("SDL2.dll")
+                    .map_err(|e| format!("Failed to find SDL2.dll in zip archive: {}", e))?;
+
+                let mut sdl2_out = std::fs::File::create(&sdl2_path)
+                    .map_err(|e| format!("Failed to create SDL2.dll file: {}", e))?;
+                std::io::copy(&mut sdl2_file, &mut sdl2_out)
+                    .map_err(|e| format!("Failed to write SDL2.dll file: {}", e))?;
+
+                std::fs::remove_file(&temp_zip_path)
+                    .map_err(|e| format!("Failed to remove temporary SDL2.dll zip file: {}", e))?;
+            }
+        }
+
+        // Are we on windows on arm64? If so, install SDL2.dll if not present
+        #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+        {
+            let sdl2_path = game_dir.join("versions").join("SDL2.dll");
+            if !sdl2_path.exists() {
+                // There aren't any official SDL2 builds for Windows ARM64, so we use an unofficial
+                // one
+                let sdl2_url = "https://www.github.com/mmozeiko/build-sdl2/releases/download/2025-12-28/SDL2-arm64-2025-12-28.zip";
+                let sdl2_response = client
+                    .get(sdl2_url)
+                    .header("User-Agent", "mineplace3d-launcher")
+                    .send()
+                    .await
+                    .map_err(|e| format!("Failed to download SDL2.dll: {}", e))?;
+
+                if !sdl2_response.status().is_success() {
+                    return Err("Failed to download SDL2.dll".to_string());
+                }
+
+                let sdl2_data = sdl2_response
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("Failed to read SDL2.dll data: {}", e))?;
+
+                let temp_zip_path = game_dir.join("versions").join("sdl2_temp.zip");
+                std::fs::write(&temp_zip_path, &sdl2_data)
+                    .map_err(|e| format!("Failed to write SDL2.dll zip file: {}", e))?;
+
+                let mut zip = zip::ZipArchive::new(
+                    std::fs::File::open(&temp_zip_path)
+                        .map_err(|e| format!("Failed to open SDL2.dll zip file: {}", e))?,
+                )
+                .map_err(|e| format!("Failed to read SDL2.dll zip archive: {}", e))?;
+
+                let mut sdl2_file = zip
+                    .by_name("SDL2.dll")
+                    .map_err(|e| format!("Failed to find SDL2.dll in zip archive: {}", e))?;
+
+                let mut sdl2_out = std::fs::File::create(&sdl2_path)
+                    .map_err(|e| format!("Failed to create SDL2.dll file: {}", e))?;
+                std::io::copy(&mut sdl2_file, &mut sdl2_out)
+                    .map_err(|e| format!("Failed to write SDL2.dll file: {}", e))?;
+
+                std::fs::remove_file(&temp_zip_path)
+                    .map_err(|e| format!("Failed to remove temporary SDL2.dll zip file: {}", e))?;
+            }
+        }
 
         #[cfg(unix)]
         {
@@ -424,6 +553,39 @@ impl Launcher {
         }
 
         Ok(version)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_sdl2() -> bool {
+        use std::process::Command;
+
+        let output = Command::new("ldconfig")
+            .arg("-p")
+            .output()
+            .expect("Failed to execute ldconfig");
+
+        if !output.status.success() {
+            return false;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.contains("libSDL2")
+    }
+
+    #[cfg(target_os = "windows")]
+    fn check_sdl2(&self) -> bool {
+        let sdl2_path = self
+            .launcher_settings
+            .game_dir
+            .join("versions")
+            .join("SDL2.dll");
+        sdl2_path.exists()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn check_sdl2() -> bool {
+        // On macOS, SDL2 is included in the app bundle, so we assume it's always present
+        true
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -577,7 +739,7 @@ impl Launcher {
                                 ..iced::widget::container::Style::default()
                             }
                         }
-                    })
+                    }),
             );
             dark = !dark;
         }
@@ -590,9 +752,37 @@ impl Launcher {
         .padding(10)
         .size(20);
 
-        let download_button = button("Download Version")
-            .padding(10)
-            .on_press(Message::Button(ButtonMessage::DownloadVersion));
+        let mut download_button = button(if self.version_downloading {
+            "Downloading..."
+        } else {
+            "Download Version"
+        })
+        .padding(10)
+        .style(if self.version_downloading {
+            |theme: &Theme, _st| {
+                let palette = theme.extended_palette();
+
+                iced::widget::button::Style {
+                    background: Some(palette.warning.weak.color.into()),
+                    text_color: palette.warning.weak.text,
+                    ..iced::widget::button::Style::default()
+                }
+            }
+        } else {
+            |theme: &Theme, _st| {
+                let palette = theme.extended_palette();
+
+                iced::widget::button::Style {
+                    background: Some(palette.primary.base.color.into()),
+                    text_color: palette.primary.base.text,
+                    ..iced::widget::button::Style::default()
+                }
+            }
+        });
+        if !self.version_downloading {
+            download_button =
+                download_button.on_press(Message::Button(ButtonMessage::DownloadVersion));
+        }
 
         let run_button = button("Run Version")
             .padding(10)
