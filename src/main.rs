@@ -287,15 +287,17 @@ impl Launcher {
             return Err(format!("Version v{} is not available", version));
         }
 
-        if !Self::check_sdl2() {
-            #[cfg(target_os = "windows")]
+
+        #[cfg(target_os = "windows")]
+        if !Self::check_sdl2(&self.launcher_settings.game_dir) {
             return Err(format!(
                 "SDL2 library is not installed. Please put the correct SDL2.dll depending on your architecture into {} to run the game.",
                 self.launcher_settings.game_dir.join("versions").display()
             ));
-            #[cfg(target_os = "linux")]
+        }
+        #[cfg(target_os = "linux")]
+        if !Self::check_sdl2() {
             return Err("SDL2 library is not installed. Please install sdl2-compat using your package manager to run the game.".to_string());
-            // The SDL2 framework would be added with the macOS app bundle anyways.
         }
 
         #[cfg(target_os = "linux")]
@@ -447,7 +449,7 @@ impl Launcher {
         {
             let sdl2_path = game_dir.join("versions").join("SDL2.dll");
             if !sdl2_path.exists() {
-                let sdl2_url = "https://www.libsdl.org/release/SDL2-2.0.14-win32-x64.zip";
+                let sdl2_url = "https://www.libsdl.org/release/SDL2-2.32.10-win32-x64.zip";
                 let sdl2_response = client
                     .get(sdl2_url)
                     .header("User-Agent", "mineplace3d-launcher")
@@ -573,10 +575,8 @@ impl Launcher {
     }
 
     #[cfg(target_os = "windows")]
-    fn check_sdl2(&self) -> bool {
-        let sdl2_path = self
-            .launcher_settings
-            .game_dir
+    fn check_sdl2(game_dir: &PathBuf) -> bool {
+        let sdl2_path = game_dir
             .join("versions")
             .join("SDL2.dll");
         sdl2_path.exists()
