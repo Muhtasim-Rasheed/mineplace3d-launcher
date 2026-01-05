@@ -1,8 +1,9 @@
 use std::{collections::HashSet, path::PathBuf};
 
-use iced::Task;
+use iced::futures::{SinkExt, StreamExt};
 use iced::widget::*;
 use iced::widget::{button, column, container, row, text, text_input};
+use iced::{Subscription, Task};
 use serde::ser::SerializeStruct;
 
 fn copy_dir(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
@@ -14,7 +15,7 @@ fn copy_dir(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
         if file_type.is_dir() {
             copy_dir(&entry.path(), &dest_path)?;
         } else {
-            std::fs::copy(&entry.path(), &dest_path)?;
+            std::fs::copy(entry.path(), &dest_path)?;
         }
     }
     Ok(())
@@ -42,12 +43,15 @@ enum Message {
     Input(InputMessage),
     VersionDownloaded(Version),
     VersionDownloadFailed(String),
+    VersionDownloadUpdateReady(iced::futures::channel::mpsc::Sender<Message>),
+    VersionDownloadUpdate(f32),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 enum VersionStage {
     Alpha,
     Beta,
+    #[default]
     Release,
 }
 
@@ -77,6 +81,18 @@ struct Version {
     patch: u32,
     stage: VersionStage,
     build: u32,
+}
+
+impl Default for Version {
+    fn default() -> Self {
+        Version {
+            major: 0,
+            minor: 2,
+            patch: 2,
+            stage: VersionStage::Release,
+            build: 0,
+        }
+    }
 }
 
 impl PartialOrd for Version {
@@ -139,7 +155,7 @@ impl std::str::FromStr for Version {
             };
             (stage, build)
         } else {
-            (VersionStage::Release, 0)
+            (VersionStage::default(), 0)
         };
 
         Ok(Version {
@@ -195,7 +211,7 @@ impl<'de> serde::Deserialize<'de> for LauncherSettings {
         let game_dir = helper
             .get("game_dir")
             .and_then(|v| v.as_str())
-            .map(|s| PathBuf::from(s))
+            .map(PathBuf::from)
             .or_else(|| dirs::data_dir().map(|data_dir| data_dir.join("mineplace3d")))
             .ok_or_else(|| serde::de::Error::custom("game_dir is required"))?;
 
@@ -214,6 +230,8 @@ struct Launcher {
     input_version_content: String,
     input_game_dir_content: String,
     version_downloading: bool,
+    version_download_progress: f32,
+    version_progress_sender: Option<iced::futures::channel::mpsc::Sender<Message>>,
     view: View,
 }
 
@@ -245,6 +263,8 @@ impl Launcher {
             input_version_content: String::new(),
             input_game_dir_content: game_dir.to_string_lossy().to_string(),
             version_downloading: false,
+            version_download_progress: 0.0,
+            version_progress_sender: None,
             view: View::Main,
         };
 
@@ -286,7 +306,6 @@ impl Launcher {
         if !self.versions.contains(&version) {
             return Err(format!("Version v{} is not available", version));
         }
-
 
         #[cfg(target_os = "windows")]
         if !Self::check_sdl2(&self.launcher_settings.game_dir) {
@@ -347,7 +366,11 @@ impl Launcher {
         Ok(())
     }
 
-    async fn download_version(game_dir: PathBuf, version: Version) -> Result<Version, String> {
+    async fn download_version(
+        game_dir: PathBuf,
+        version: Version,
+        mut progress_tx: iced::futures::channel::mpsc::Sender<Message>,
+    ) -> Result<Version, String> {
         let release_url = format!(
             "https://api.github.com/repos/Muhtasim-Rasheed/mineplace3d/releases/tags/v{}",
             version
@@ -424,11 +447,6 @@ impl Launcher {
             return Err(format!("Failed to download asset for version v{}", version));
         }
 
-        let binary_data = download_response
-            .bytes()
-            .await
-            .map_err(|e| format!("Failed to read downloaded asset: {}", e))?;
-
         let exec_path = game_dir
             .join("versions")
             .join(if cfg!(target_os = "windows") {
@@ -439,65 +457,43 @@ impl Launcher {
                 version.to_string()
             });
 
+        let total_size = download_response.content_length();
+        let mut downloaded = 0u64;
+        let mut stream = download_response.bytes_stream();
+
         println!("Writing executable to {:?}", exec_path);
 
-        std::fs::write(&exec_path, &binary_data)
-            .map_err(|e| format!("Failed to write executable for version v{}: {}", version, e))?;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&exec_path)
+                .and_then(|mut file| std::io::copy(&mut chunk.as_ref(), &mut file))
+                .map_err(|e| format!("Write error: {}", e))?;
 
-        // Are we on windows on x64? If so, install SDL2.dll if not present
-        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-        {
-            let sdl2_path = game_dir.join("versions").join("SDL2.dll");
-            if !sdl2_path.exists() {
-                let sdl2_url = "https://www.libsdl.org/release/SDL2-2.32.10-win32-x64.zip";
-                let sdl2_response = client
-                    .get(sdl2_url)
-                    .header("User-Agent", "mineplace3d-launcher")
-                    .send()
-                    .await
-                    .map_err(|e| format!("Failed to download SDL2.dll: {}", e))?;
+            downloaded += chunk.len() as u64;
 
-                if !sdl2_response.status().is_success() {
-                    return Err("Failed to download SDL2.dll".to_string());
-                }
-
-                let sdl2_data = sdl2_response
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("Failed to read SDL2.dll data: {}", e))?;
-
-                let temp_zip_path = game_dir.join("versions").join("sdl2_temp.zip");
-                std::fs::write(&temp_zip_path, &sdl2_data)
-                    .map_err(|e| format!("Failed to write SDL2.dll zip file: {}", e))?;
-
-                let mut zip = zip::ZipArchive::new(
-                    std::fs::File::open(&temp_zip_path)
-                        .map_err(|e| format!("Failed to open SDL2.dll zip file: {}", e))?,
-                )
-                .map_err(|e| format!("Failed to read SDL2.dll zip archive: {}", e))?;
-
-                let mut sdl2_file = zip
-                    .by_name("SDL2.dll")
-                    .map_err(|e| format!("Failed to find SDL2.dll in zip archive: {}", e))?;
-
-                let mut sdl2_out = std::fs::File::create(&sdl2_path)
-                    .map_err(|e| format!("Failed to create SDL2.dll file: {}", e))?;
-                std::io::copy(&mut sdl2_file, &mut sdl2_out)
-                    .map_err(|e| format!("Failed to write SDL2.dll file: {}", e))?;
-
-                std::fs::remove_file(&temp_zip_path)
-                    .map_err(|e| format!("Failed to remove temporary SDL2.dll zip file: {}", e))?;
+            if let Some(total) = total_size {
+                let progress = downloaded as f32 / total as f32;
+                let _ = progress_tx.try_send(Message::VersionDownloadUpdate(progress));
             }
         }
 
-        // Are we on windows on arm64? If so, install SDL2.dll if not present
-        #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+        let _ = progress_tx.try_send(Message::VersionDownloadUpdate(1.0));
+
+        // Are we on windows? If so, install SDL2.dll if not present
+        #[cfg(target_os = "windows")]
         {
             let sdl2_path = game_dir.join("versions").join("SDL2.dll");
             if !sdl2_path.exists() {
-                // There aren't any official SDL2 builds for Windows ARM64, so we use an unofficial
-                // one
+                #[cfg(target_arch = "x86_64")]
+                let sdl2_url = "https://www.libsdl.org/release/SDL2-2.32.10-win32-x64.zip";
+
+                // SDL doesn't provide official arm64 builds, so we use a community build
+                #[cfg(target_arch = "aarch64")]
                 let sdl2_url = "https://www.github.com/mmozeiko/build-sdl2/releases/download/2025-12-28/SDL2-arm64-2025-12-28.zip";
+
                 let sdl2_response = client
                     .get(sdl2_url)
                     .header("User-Agent", "mineplace3d-launcher")
@@ -509,14 +505,31 @@ impl Launcher {
                     return Err("Failed to download SDL2.dll".to_string());
                 }
 
-                let sdl2_data = sdl2_response
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("Failed to read SDL2.dll data: {}", e))?;
+                let total_size = sdl2_response.content_length();
+                let mut downloaded = 0u64;
 
                 let temp_zip_path = game_dir.join("versions").join("sdl2_temp.zip");
-                std::fs::write(&temp_zip_path, &sdl2_data)
-                    .map_err(|e| format!("Failed to write SDL2.dll zip file: {}", e))?;
+
+                let mut stream = sdl2_response.bytes_stream();
+
+                let _ = progress_tx.try_send(Message::VersionDownloadUpdate(0.0));
+
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&temp_zip_path)
+                        .and_then(|mut file| std::io::copy(&mut chunk.as_ref(), &mut file))
+                        .map_err(|e| format!("Write error: {}", e))?;
+
+                    downloaded += chunk.len() as u64;
+
+                    if let Some(total) = total_size {
+                        let progress = downloaded as f32 / total as f32;
+                        let _ = progress_tx.try_send(Message::VersionDownloadUpdate(progress));
+                    }
+                }
 
                 let mut zip = zip::ZipArchive::new(
                     std::fs::File::open(&temp_zip_path)
@@ -535,6 +548,8 @@ impl Launcher {
 
                 std::fs::remove_file(&temp_zip_path)
                     .map_err(|e| format!("Failed to remove temporary SDL2.dll zip file: {}", e))?;
+
+                _ = progress_tx.try_send(1.0);
             }
         }
 
@@ -576,9 +591,7 @@ impl Launcher {
 
     #[cfg(target_os = "windows")]
     fn check_sdl2(game_dir: &PathBuf) -> bool {
-        let sdl2_path = game_dir
-            .join("versions")
-            .join("SDL2.dll");
+        let sdl2_path = game_dir.join("versions").join("SDL2.dll");
         sdl2_path.exists()
     }
 
@@ -586,6 +599,35 @@ impl Launcher {
     fn check_sdl2() -> bool {
         // On macOS, SDL2 is included in the app bundle, so we assume it's always present
         true
+    }
+
+    /// Subscription to handle download progress updates.
+    ///
+    /// This subscription sets up a channel to receive progress updates from the
+    /// asynchronous download task and simply forwards them as messages to the main application.
+    fn subscription(&self) -> Subscription<Message> {
+        Subscription::run(|| {
+            iced::stream::channel(100, async |mut sender| {
+                let (tx, mut rx) = iced::futures::channel::mpsc::channel(100);
+
+                // Notify the main application that the progress update channel is ready and give
+                // it a way to send progress updates.
+                sender
+                    .send(Message::VersionDownloadUpdateReady(tx))
+                    .await
+                    .unwrap();
+
+                // Forward progress updates from the download task to the main application
+                loop {
+                    if let Some(Message::VersionDownloadUpdate(progress)) = rx.next().await {
+                        sender
+                            .send(Message::VersionDownloadUpdate(progress))
+                            .await
+                            .unwrap();
+                    }
+                }
+            })
+        })
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -596,17 +638,29 @@ impl Launcher {
                         if self.versions.contains(&version) {
                             return Task::none();
                         }
+
                         self.version_downloading = true;
-                        Task::perform(
-                            Self::download_version(
-                                self.launcher_settings.game_dir.clone(),
-                                version,
-                            ),
-                            |res| match res {
-                                Ok(v) => Message::VersionDownloaded(v),
-                                Err(e) => Message::VersionDownloadFailed(e),
-                            },
-                        )
+
+                        // The runtime knows about the subscription, so we don't need to do
+                        // anything else here.
+                        
+                        let game_dir = self.launcher_settings.game_dir.clone();
+                        if let Ok(version) = self.input_version_content.parse() {
+                            let sender = self.version_progress_sender.clone().expect("Progress sender not set");
+
+                            let download_task =
+                                Task::perform(Self::download_version(game_dir, version, sender), |res| {
+                                    match res {
+                                        Ok(v) => Message::VersionDownloaded(v),
+                                        Err(e) => Message::VersionDownloadFailed(e),
+                                    }
+                                });
+
+                            download_task
+                        } else {
+                            eprintln!("Invalid version format: {}", self.input_version_content);
+                            Task::none()
+                        }
                     } else {
                         eprintln!("Invalid version format: {}", self.input_version_content);
                         Task::none()
@@ -698,11 +752,20 @@ impl Launcher {
                     .join("versions.json");
                 std::fs::write(versions_file_path, versions_data)
                     .expect("Failed to write versions file");
-                println!("Version v{} downloaded successfully", version);
                 Task::none()
             }
             Message::VersionDownloadFailed(error) => {
                 eprintln!("Version download failed: {}", error);
+                self.version_downloading = false;
+                self.version_download_progress = 0.0;
+                Task::none()
+            }
+            Message::VersionDownloadUpdateReady(sender) => {
+                self.version_progress_sender = Some(sender);
+                Task::none()
+            }
+            Message::VersionDownloadUpdate(progress) => {
+                self.version_download_progress = progress;
                 Task::none()
             }
         }
@@ -758,30 +821,36 @@ impl Launcher {
             "Download Version"
         })
         .padding(10)
-        .style(if self.version_downloading {
-            |theme: &Theme, _st| {
-                let palette = theme.extended_palette();
+        .style(|theme: &Theme, status: button::Status| {
+            let palette = theme.extended_palette();
 
-                iced::widget::button::Style {
+            match status {
+                button::Status::Disabled => iced::widget::button::Style {
                     background: Some(palette.warning.weak.color.into()),
                     text_color: palette.warning.weak.text,
                     ..iced::widget::button::Style::default()
-                }
-            }
-        } else {
-            |theme: &Theme, _st| {
-                let palette = theme.extended_palette();
-
-                iced::widget::button::Style {
+                },
+                _ => iced::widget::button::Style {
                     background: Some(palette.primary.base.color.into()),
                     text_color: palette.primary.base.text,
                     ..iced::widget::button::Style::default()
-                }
+                },
             }
         });
-        if !self.version_downloading {
+
+        if !self.version_downloading && !self.input_version_content.is_empty() {
             download_button =
                 download_button.on_press(Message::Button(ButtonMessage::DownloadVersion));
+        }
+
+        match self.input_version_content.parse::<Version>() {
+            Ok(version) if self.versions.contains(&version) || self.version_downloading => {
+                download_button = download_button.on_press_maybe(None);
+            }
+            Err(_) => {
+                download_button = download_button.on_press_maybe(None);
+            }
+            _ => {}
         }
 
         let run_button = button("Run Version")
@@ -792,7 +861,7 @@ impl Launcher {
             .padding(10)
             .on_press(Message::Button(ButtonMessage::OpenSettings));
 
-        let content = column![
+        let mut content = column![
             text("Mineplace3D Launcher").size(30),
             text("Installed Versions:").size(20),
             installed_versions,
@@ -802,6 +871,20 @@ impl Launcher {
         ]
         .spacing(20)
         .padding(20);
+
+        if self.version_downloading {
+            let progress_bar =
+                iced::widget::progress_bar(0.0..=1.0, self.version_download_progress)
+                    .length(iced::Length::Fill)
+                    .girth(20);
+            content = content.push(progress_bar);
+            let progress_text = text(format!(
+                "Download Progress: {:.2}%",
+                self.version_download_progress * 100.0
+            ))
+            .size(16);
+            content = content.push(progress_text);
+        }
 
         container(content).center(iced::Fill).into()
     }
@@ -849,5 +932,7 @@ fn main() -> iced::Result {
     iced::application(Launcher::new, Launcher::update, Launcher::view)
         .theme(iced::theme::Theme::CatppuccinMocha)
         .default_font(iced::Font::MONOSPACE)
+        .title("Mineplace3D Launcher")
+        .subscription(Launcher::subscription)
         .run()
 }
