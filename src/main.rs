@@ -859,5 +859,6 @@ fn main() -> iced::Result {
         .default_font(iced::Font::MONOSPACE)
         .title("Mineplace3D Launcher")
         .subscription(Launcher::subscription)
+        .window_size((600, 800))
         .run()
 }
