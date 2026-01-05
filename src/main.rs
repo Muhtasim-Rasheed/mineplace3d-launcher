@@ -7,7 +7,7 @@ use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Subscription, Task};
 use serde::ser::SerializeStruct;
 
-use crate::utils::copy_dir;
+use crate::utils::{bytes_to_human_readable, copy_dir};
 use crate::version::Version;
 
 mod utils;
@@ -36,7 +36,26 @@ enum Message {
     VersionDownloaded(Version),
     VersionDownloadFailed(String),
     VersionDownloadUpdateReady(Sender<Message>),
-    VersionDownloadUpdate(f32),
+    VersionDownloadUpdate(DownloadUpdate),
+    VersionDownloadClear,
+}
+
+#[derive(Debug, Default, Clone)]
+enum DownloadUpdate {
+    Progress {
+        progress: f32,
+        /// Bytes per second
+        speed: f32,
+    },
+    Finished,
+    #[default]
+    None,
+}
+
+impl DownloadUpdate {
+    fn new(progress: f32, speed: f32) -> Self {
+        Self::Progress { progress, speed }
+    }
 }
 
 #[derive(Debug)]
@@ -83,8 +102,8 @@ struct Launcher {
     input_version_content: String,
     input_game_dir_content: String,
     version_downloading: bool,
-    version_download_progress: f32,
-    version_progress_sender: Option<Sender<Message>>,
+    version_download_update: DownloadUpdate,
+    version_update_sender: Option<Sender<Message>>,
     view: View,
 }
 
@@ -116,8 +135,8 @@ impl Launcher {
             input_version_content: String::new(),
             input_game_dir_content: game_dir.to_string_lossy().to_string(),
             version_downloading: false,
-            version_download_progress: 0.0,
-            version_progress_sender: None,
+            version_download_update: DownloadUpdate::default(),
+            version_update_sender: None,
             view: View::Main,
         };
 
@@ -314,10 +333,12 @@ impl Launcher {
         let mut downloaded = 0u64;
         let mut stream = download_response.bytes_stream();
 
-        println!("Writing executable to {:?}", exec_path);
+        let mut last_tick = std::time::Instant::now();
+        let mut downloaded_since_last = 0u64;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+
             std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -325,15 +346,29 @@ impl Launcher {
                 .and_then(|mut file| std::io::copy(&mut chunk.as_ref(), &mut file))
                 .map_err(|e| format!("Write error: {}", e))?;
 
-            downloaded += chunk.len() as u64;
+            let len = chunk.len() as u64;
+            downloaded += len;
+            downloaded_since_last += len;
 
-            if let Some(total) = total_size {
-                let progress = downloaded as f32 / total as f32;
-                let _ = progress_tx.try_send(Message::VersionDownloadUpdate(progress));
+            let elapsed = last_tick.elapsed();
+
+            // Only update speed every 250ms
+            if elapsed >= std::time::Duration::from_millis(250) {
+                if let Some(total) = total_size {
+                    let progress = downloaded as f32 / total as f32;
+                    let speed = downloaded_since_last as f32 / elapsed.as_secs_f32();
+
+                    let _ = progress_tx.try_send(Message::VersionDownloadUpdate(
+                        DownloadUpdate::new(progress, speed),
+                    ));
+                }
+
+                downloaded_since_last = 0;
+                last_tick = std::time::Instant::now();
             }
         }
 
-        let _ = progress_tx.try_send(Message::VersionDownloadUpdate(1.0));
+        let _ = progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Finished));
 
         // Are we on windows? If so, install SDL2.dll if not present
         #[cfg(target_os = "windows")]
@@ -358,31 +393,52 @@ impl Launcher {
                     return Err("Failed to download SDL2.dll".to_string());
                 }
 
-                let total_size = sdl2_response.content_length();
-                let mut downloaded = 0u64;
-
                 let temp_zip_path = game_dir.join("versions").join("sdl2_temp.zip");
 
-                let mut stream = sdl2_response.bytes_stream();
+                let _ = progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::new(
+                    0.0, 0.0,
+                )));
 
-                let _ = progress_tx.try_send(Message::VersionDownloadUpdate(0.0));
+                let total_size = download_response.content_length();
+                let mut downloaded = 0u64;
+                let mut stream = download_response.bytes_stream();
+
+                let mut last_tick = std::time::Instant::now();
+                let mut downloaded_since_last = 0u64;
 
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+
                     std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(&temp_zip_path)
+                        .open(&exec_path)
                         .and_then(|mut file| std::io::copy(&mut chunk.as_ref(), &mut file))
                         .map_err(|e| format!("Write error: {}", e))?;
 
-                    downloaded += chunk.len() as u64;
+                    let len = chunk.len() as u64;
+                    downloaded += len;
+                    downloaded_since_last += len;
 
-                    if let Some(total) = total_size {
-                        let progress = downloaded as f32 / total as f32;
-                        let _ = progress_tx.try_send(Message::VersionDownloadUpdate(progress));
+                    let elapsed = last_tick.elapsed();
+
+                    if elapsed >= std::time::Duration::from_millis(250) {
+                        if let Some(total) = total_size {
+                            let progress = downloaded as f32 / total as f32;
+                            let speed = downloaded_since_last as f32 / elapsed.as_secs_f32();
+
+                            let _ = progress_tx.try_send(Message::VersionDownloadUpdate(
+                                DownloadUpdate::new(progress, speed),
+                            ));
+                        }
+
+                        downloaded_since_last = 0;
+                        last_tick = std::time::Instant::now();
                     }
                 }
+
+                let _ =
+                    progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Finished));
 
                 let mut zip = zip::ZipArchive::new(
                     std::fs::File::open(&temp_zip_path)
@@ -472,9 +528,9 @@ impl Launcher {
 
                 // Forward progress updates from the download task to the main application
                 loop {
-                    if let Some(Message::VersionDownloadUpdate(progress)) = rx.next().await {
+                    if let Some(Message::VersionDownloadUpdate(update)) = rx.next().await {
                         sender
-                            .send(Message::VersionDownloadUpdate(progress))
+                            .send(Message::VersionDownloadUpdate(update))
                             .await
                             .unwrap();
                     }
@@ -494,20 +550,20 @@ impl Launcher {
 
                         self.version_downloading = true;
 
-                        // The runtime knows about the subscription, so we don't need to do
-                        // anything else here.
-                        
                         let game_dir = self.launcher_settings.game_dir.clone();
                         if let Ok(version) = self.input_version_content.parse() {
-                            let sender = self.version_progress_sender.clone().expect("Progress sender not set");
+                            let sender = self
+                                .version_update_sender
+                                .clone()
+                                .expect("Download update sender not set");
 
-                            let download_task =
-                                Task::perform(Self::download_version(game_dir, version, sender), |res| {
-                                    match res {
-                                        Ok(v) => Message::VersionDownloaded(v),
-                                        Err(e) => Message::VersionDownloadFailed(e),
-                                    }
-                                });
+                            let download_task = Task::perform(
+                                Self::download_version(game_dir, version, sender),
+                                |res| match res {
+                                    Ok(v) => Message::VersionDownloaded(v),
+                                    Err(e) => Message::VersionDownloadFailed(e),
+                                },
+                            );
 
                             download_task
                         } else {
@@ -605,20 +661,29 @@ impl Launcher {
                     .join("versions.json");
                 std::fs::write(versions_file_path, versions_data)
                     .expect("Failed to write versions file");
+                Task::perform(
+                    async {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    },
+                    |_| Message::VersionDownloadClear,
+                )
+            }
+            Message::VersionDownloadClear => {
+                self.version_download_update = DownloadUpdate::default();
                 Task::none()
             }
             Message::VersionDownloadFailed(error) => {
                 eprintln!("Version download failed: {}", error);
                 self.version_downloading = false;
-                self.version_download_progress = 0.0;
+                self.version_download_update = DownloadUpdate::default();
                 Task::none()
             }
             Message::VersionDownloadUpdateReady(sender) => {
-                self.version_progress_sender = Some(sender);
+                self.version_update_sender = Some(sender);
                 Task::none()
             }
-            Message::VersionDownloadUpdate(progress) => {
-                self.version_download_progress = progress;
+            Message::VersionDownloadUpdate(update) => {
+                self.version_download_update = update;
                 Task::none()
             }
         }
@@ -725,17 +790,24 @@ impl Launcher {
         .spacing(20)
         .padding(20);
 
-        if self.version_downloading {
-            let progress_bar =
-                iced::widget::progress_bar(0.0..=1.0, self.version_download_progress)
-                    .length(iced::Length::Fill)
-                    .girth(20);
+        if let DownloadUpdate::Progress { progress, speed } = self.version_download_update {
+            let progress_bar = iced::widget::progress_bar(0.0..=1.0, progress)
+                .length(iced::Length::Fill)
+                .girth(20);
             content = content.push(progress_bar);
             let progress_text = text(format!(
-                "Download Progress: {:.2}%",
-                self.version_download_progress * 100.0
+                "Download Progress: {:.2}%, Speed: {}/s",
+                progress * 100.0,
+                bytes_to_human_readable(speed),
             ))
             .size(16);
+            content = content.push(progress_text);
+        } else if let DownloadUpdate::Finished = self.version_download_update {
+            let progress_bar = iced::widget::progress_bar(0.0..=1.0, 1.0)
+                .length(iced::Length::Fill)
+                .girth(20);
+            content = content.push(progress_bar);
+            let progress_text = text("Download Complete!").size(16);
             content = content.push(progress_text);
         }
 
