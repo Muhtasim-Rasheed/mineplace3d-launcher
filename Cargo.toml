@@ -4,10 +4,11 @@ version = "0.1.1"
 edition = "2024"
 
 [dependencies]
+bytes = "1.11.0"
 dirs = "6.0.0"
 iced = { version = "0.14.0", features = ["tokio"] }
 reqwest = { version = "0.13.1", features = ["json", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.148"
-tokio = "1.49.0"
+tokio = { version = "1.49.0", features = ["macros", "tokio-macros"] }
 zip = "7.0.0"

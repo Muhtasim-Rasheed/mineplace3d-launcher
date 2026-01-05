@@ -48,6 +48,9 @@ enum DownloadUpdate {
         speed: f32,
     },
     Finished,
+    Failed {
+        last_progress: Option<f32>,
+    },
     #[default]
     None,
 }
@@ -239,6 +242,68 @@ impl Launcher {
         version: Version,
         mut progress_tx: Sender<Message>,
     ) -> Result<Version, String> {
+        async fn download(content_length: Option<u64>, mut stream: impl iced::futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin, progress_tx: &mut Sender<Message>) {
+            let mut downloaded = 0u64;
+            let mut last_progress = 0.0;
+
+            let mut last_tick = std::time::Instant::now();
+            let mut downloaded_since_last = 0u64;
+
+            let stall_timeout = std::time::Duration::from_secs(10);
+            let mut last_chunk_at = std::time::Instant::now();
+
+            loop {
+                tokio::select! {
+                    chunk = stream.next() => {
+                        match chunk {
+                            Some(Ok(bytes)) => {
+                                last_chunk_at = std::time::Instant::now();
+
+                                let len = bytes.len() as u64;
+                                downloaded += len;
+                                downloaded_since_last += len;
+
+                                let elapsed = last_tick.elapsed();
+
+                                // Only update speed every 250ms
+                                if elapsed >= std::time::Duration::from_millis(250) {
+                                    if let Some(total) = content_length {
+                                        let progress = downloaded as f32 / total as f32;
+                                        last_progress = progress;
+                                        let speed = downloaded_since_last as f32 / elapsed.as_secs_f32();
+
+                                        let _ = progress_tx.try_send(Message::VersionDownloadUpdate(
+                                            DownloadUpdate::new(progress, speed),
+                                        ));
+                                    }
+
+                                    downloaded_since_last = 0;
+                                    last_tick = std::time::Instant::now();
+                                }
+                            }
+                            Some(Err(e)) => {
+                                let _ = progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Failed {
+                                    last_progress: Some(last_progress),
+                                }));
+                                eprintln!("Download error: {}", e);
+                                return;
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = tokio::time::sleep(stall_timeout) => {
+                        if last_chunk_at.elapsed() >= stall_timeout {
+                            let _ = progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Failed {
+                                last_progress: Some(last_progress),
+                            }));
+                            eprintln!("Download stalled for more than {:?}, aborting.", stall_timeout);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         let release_url = format!(
             "https://api.github.com/repos/Muhtasim-Rasheed/mineplace3d/releases/tags/v{}",
             version
@@ -326,43 +391,9 @@ impl Launcher {
             });
 
         let total_size = download_response.content_length();
-        let mut downloaded = 0u64;
-        let mut stream = download_response.bytes_stream();
+        let stream = download_response.bytes_stream();
 
-        let mut last_tick = std::time::Instant::now();
-        let mut downloaded_since_last = 0u64;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
-
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&exec_path)
-                .and_then(|mut file| std::io::copy(&mut chunk.as_ref(), &mut file))
-                .map_err(|e| format!("Write error: {}", e))?;
-
-            let len = chunk.len() as u64;
-            downloaded += len;
-            downloaded_since_last += len;
-
-            let elapsed = last_tick.elapsed();
-
-            // Only update speed every 250ms
-            if elapsed >= std::time::Duration::from_millis(250) {
-                if let Some(total) = total_size {
-                    let progress = downloaded as f32 / total as f32;
-                    let speed = downloaded_since_last as f32 / elapsed.as_secs_f32();
-
-                    let _ = progress_tx.try_send(Message::VersionDownloadUpdate(
-                        DownloadUpdate::new(progress, speed),
-                    ));
-                }
-
-                downloaded_since_last = 0;
-                last_tick = std::time::Instant::now();
-            }
-        }
+        download(total_size, stream, &mut progress_tx).await;
 
         let _ = progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Finished));
 
@@ -396,42 +427,9 @@ impl Launcher {
                 )));
 
                 let total_size = download_response.content_length();
-                let mut downloaded = 0u64;
-                let mut stream = download_response.bytes_stream();
+                let stream = download_response.bytes_stream();
 
-                let mut last_tick = std::time::Instant::now();
-                let mut downloaded_since_last = 0u64;
-
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
-
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&exec_path)
-                        .and_then(|mut file| std::io::copy(&mut chunk.as_ref(), &mut file))
-                        .map_err(|e| format!("Write error: {}", e))?;
-
-                    let len = chunk.len() as u64;
-                    downloaded += len;
-                    downloaded_since_last += len;
-
-                    let elapsed = last_tick.elapsed();
-
-                    if elapsed >= std::time::Duration::from_millis(250) {
-                        if let Some(total) = total_size {
-                            let progress = downloaded as f32 / total as f32;
-                            let speed = downloaded_since_last as f32 / elapsed.as_secs_f32();
-
-                            let _ = progress_tx.try_send(Message::VersionDownloadUpdate(
-                                DownloadUpdate::new(progress, speed),
-                            ));
-                        }
-
-                        downloaded_since_last = 0;
-                        last_tick = std::time::Instant::now();
-                    }
-                }
+                download(total_size, stream, &mut progress_tx).await;
 
                 let _ =
                     progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Finished));
@@ -671,8 +669,21 @@ impl Launcher {
             Message::VersionDownloadFailed(error) => {
                 eprintln!("Version download failed: {}", error);
                 self.version_downloading = false;
-                self.version_download_update = DownloadUpdate::default();
-                Task::none()
+                if let DownloadUpdate::Progress { progress, .. } =
+                    self.version_download_update
+                {
+                    self.version_download_update = DownloadUpdate::Failed {
+                        last_progress: Some(progress),
+                    };
+                } else {
+                    self.version_download_update = DownloadUpdate::Failed { last_progress: None };
+                }
+                Task::perform(
+                    async {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    },
+                    |_| Message::VersionDownloadClear,
+                )
             }
             Message::VersionDownloadUpdateReady(sender) => {
                 self.version_update_sender = Some(sender);
@@ -804,6 +815,16 @@ impl Launcher {
                 .girth(20);
             content = content.push(progress_bar);
             let progress_text = text("Download Complete!").size(16);
+            content = content.push(progress_text);
+        } else if let DownloadUpdate::Failed { last_progress } = self.version_download_update {
+            if let Some(progress) = last_progress {
+                let progress_bar = iced::widget::progress_bar(0.0..=1.0, progress)
+                    .length(iced::Length::Fill)
+                    .girth(20)
+                    .style(progress_bar::danger);
+                content = content.push(progress_bar);
+            }
+            let progress_text = text("Download Failed!").size(16);
             content = content.push(progress_text);
         }
 
