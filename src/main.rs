@@ -151,17 +151,13 @@ impl Launcher {
             .expect("Failed to create versions directory");
     }
 
-    fn get_file_from_game_dir(&self, relative_path: &str) -> Result<String, String> {
-        let full_path = self.launcher_settings.game_dir.join(relative_path);
-        if full_path.exists() {
-            return std::fs::read_to_string(full_path)
-                .map_err(|e| format!("Failed to read file {}: {}", relative_path, e));
-        }
-        Err(format!("File {} does not exist", relative_path))
-    }
-
     fn load_versions(&mut self) {
-        if let Ok(versions_data) = self.get_file_from_game_dir("versions/versions.json") {
+        let full_path = self
+            .launcher_settings
+            .game_dir
+            .join("versions")
+            .join("versions.json");
+        if let Ok(versions_data) = std::fs::read_to_string(full_path) {
             let versions: HashSet<String> =
                 serde_json::from_str(&versions_data).expect("Failed to parse versions data");
             let versions_parsed: HashSet<Version> = versions
