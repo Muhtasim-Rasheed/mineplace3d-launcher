@@ -432,8 +432,8 @@ impl Launcher {
                     0.0, 0.0,
                 )));
 
-                let total_size = download_response.content_length();
-                let stream = download_response.bytes_stream();
+                let total_size = sdl2_response.content_length();
+                let stream = sdl2_response.bytes_stream();
 
                 download(total_size, stream, &mut progress_tx).await;
 
@@ -458,7 +458,8 @@ impl Launcher {
                 std::fs::remove_file(&temp_zip_path)
                     .map_err(|e| format!("Failed to remove temporary SDL2.dll zip file: {}", e))?;
 
-                _ = progress_tx.try_send(1.0);
+                let _ =
+                    progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Finished));
             }
         }
 
