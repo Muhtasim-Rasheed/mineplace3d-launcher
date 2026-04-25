@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::{collections::HashSet, path::PathBuf};
 
 use iced::futures::channel::mpsc::Sender;
@@ -242,7 +244,11 @@ impl Launcher {
         version: Version,
         mut progress_tx: Sender<Message>,
     ) -> Result<Version, String> {
-        async fn download(content_length: Option<u64>, mut stream: impl iced::futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin, progress_tx: &mut Sender<Message>) {
+        async fn download(
+            content_length: Option<u64>,
+            mut stream: impl iced::futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+            progress_tx: &mut Sender<Message>,
+        ) {
             let mut downloaded = 0u64;
             let mut last_progress = 0.0;
 
@@ -669,14 +675,14 @@ impl Launcher {
             Message::VersionDownloadFailed(error) => {
                 eprintln!("Version download failed: {}", error);
                 self.version_downloading = false;
-                if let DownloadUpdate::Progress { progress, .. } =
-                    self.version_download_update
-                {
+                if let DownloadUpdate::Progress { progress, .. } = self.version_download_update {
                     self.version_download_update = DownloadUpdate::Failed {
                         last_progress: Some(progress),
                     };
                 } else {
-                    self.version_download_update = DownloadUpdate::Failed { last_progress: None };
+                    self.version_download_update = DownloadUpdate::Failed {
+                        last_progress: None,
+                    };
                 }
                 Task::perform(
                     async {
