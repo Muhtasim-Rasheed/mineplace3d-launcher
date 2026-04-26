@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+use serde::Deserialize;
 
 pub fn copy_dir(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
@@ -24,4 +27,56 @@ pub fn bytes_to_human_readable(bytes: f32) -> String {
         unit_index += 1;
     }
     format!("{:.2} {}", size, UNITS[unit_index])
+}
+
+pub fn platform_key() -> String {
+    let os = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "unknown"
+    };
+
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unknown"
+    };
+
+    format!("{os}_{arch}")
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Manifest {
+    pub latest: Latest,
+    pub base: String,
+    pub versions: HashMap<String, VersionEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Latest {
+    pub beta: Option<String>,
+    pub alpha: Option<String>,
+    pub stable: Option<String>,
+}
+
+impl Latest {
+    pub fn get_latest_version(&self) -> Option<&str> {
+        self.stable
+            .as_ref()
+            .or(self.beta.as_ref())
+            .or(self.alpha.as_ref())
+            .map(|v| v.as_str())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VersionEntry {
+    pub uploaded_on: String,
+    pub files: HashMap<String, String>,
 }

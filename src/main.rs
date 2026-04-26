@@ -8,8 +8,9 @@ use iced::widget::*;
 use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Subscription, Task};
 use serde::ser::SerializeStruct;
+use tokio::io::AsyncWriteExt;
 
-use crate::utils::{bytes_to_human_readable, copy_dir};
+use crate::utils::{Manifest, bytes_to_human_readable, copy_dir};
 use crate::version::Version;
 
 mod utils;
@@ -241,14 +242,19 @@ impl Launcher {
 
     async fn download_version(
         game_dir: PathBuf,
-        version: Version,
+        version: Option<Version>,
         mut progress_tx: Sender<Message>,
     ) -> Result<Version, String> {
-        async fn download(
+        async fn download_to_file(
             content_length: Option<u64>,
             mut stream: impl iced::futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+            path: std::path::PathBuf,
             progress_tx: &mut Sender<Message>,
-        ) {
+        ) -> Result<(), String> {
+            let mut file = tokio::fs::File::create(&path)
+                .await
+                .map_err(|e| e.to_string())?;
+
             let mut downloaded = 0u64;
             let mut last_progress = 0.0;
 
@@ -265,17 +271,21 @@ impl Launcher {
                             Some(Ok(bytes)) => {
                                 last_chunk_at = std::time::Instant::now();
 
+                                file.write_all(&bytes)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+
                                 let len = bytes.len() as u64;
                                 downloaded += len;
                                 downloaded_since_last += len;
 
                                 let elapsed = last_tick.elapsed();
 
-                                // Only update speed every 250ms
                                 if elapsed >= std::time::Duration::from_millis(250) {
                                     if let Some(total) = content_length {
                                         let progress = downloaded as f32 / total as f32;
                                         last_progress = progress;
+
                                         let speed = downloaded_since_last as f32 / elapsed.as_secs_f32();
 
                                         let _ = progress_tx.try_send(Message::VersionDownloadUpdate(
@@ -288,118 +298,94 @@ impl Launcher {
                                 }
                             }
                             Some(Err(e)) => {
-                                let _ = progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Failed {
-                                    last_progress: Some(last_progress),
-                                }));
-                                eprintln!("Download error: {}", e);
-                                return;
+                                let _ = progress_tx.try_send(Message::VersionDownloadUpdate(
+                                    DownloadUpdate::Failed {
+                                        last_progress: Some(last_progress),
+                                    }
+                                ));
+                                return Err(e.to_string());
                             }
                             None => break,
                         }
                     }
+
                     _ = tokio::time::sleep(stall_timeout) => {
                         if last_chunk_at.elapsed() >= stall_timeout {
-                            let _ = progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Failed {
-                                last_progress: Some(last_progress),
-                            }));
-                            eprintln!("Download stalled for more than {:?}, aborting.", stall_timeout);
-                            return;
+                            let _ = progress_tx.try_send(Message::VersionDownloadUpdate(
+                                DownloadUpdate::Failed {
+                                    last_progress: Some(last_progress),
+                                }
+                            ));
+                            return Err("Download stalled".to_string());
                         }
                     }
                 }
             }
+
+            Ok(())
         }
 
-        let release_url = format!(
-            "https://api.github.com/repos/Muhtasim-Rasheed/mineplace3d/releases/tags/v{}",
-            version
-        );
+        let manifest_url = "https://muhtasim-rasheed.github.io/mineplace3d/manifest.json";
 
         let client = reqwest::Client::new();
-        let response = client
-            .get(&release_url)
+
+        let manifest: Manifest = client
+            .get(manifest_url)
             .header("User-Agent", "mineplace3d-launcher")
             .send()
             .await
-            .map_err(|e| format!("Failed to fetch release info: {}", e))?;
-
-        if !response.status().is_success() {
-            return Err(format!("Release for version v{} not found", version));
-        }
-
-        let release_info: serde_json::Value = response
+            .map_err(|e| e.to_string())?
             .json()
             .await
-            .map_err(|e| format!("Failed to parse release info: {}", e))?;
+            .map_err(|e| e.to_string())?;
 
-        let asset = release_info["assets"]
-            .as_array()
-            .and_then(|assets| {
-                let platform = if cfg!(target_os = "windows") {
-                    "windows"
-                } else if cfg!(target_os = "linux") {
-                    "linux"
-                } else if cfg!(target_os = "macos") {
-                    "macos"
-                } else {
-                    "unknown"
-                };
+        let version_string = match version {
+            Some(v) => Some(v.to_string()),
+            None => manifest.latest.get_latest_version().map(|v| v.to_string()),
+        }
+        .ok_or_else(|| {
+            "No version specified and no latest version found in manifest".to_string()
+        })?;
 
-                let arch = if cfg!(target_arch = "x86_64") {
-                    "x86_64"
-                } else if cfg!(target_arch = "aarch64") {
-                    "aarch64"
-                } else {
-                    "unknown"
-                };
+        let entry = manifest
+            .versions
+            .get(&version_string)
+            .ok_or_else(|| format!("Version v{} not found in manifest", version_string))?;
 
-                assets.iter().find(|asset| {
-                    let name = format!(
-                        "mineplace3d-{}-{}{}",
-                        platform,
-                        arch,
-                        if cfg!(target_os = "windows") {
-                            ".exe"
-                        } else if cfg!(target_os = "macos") {
-                            ".app"
-                        } else {
-                            ""
-                        }
-                    );
-                    asset["name"].as_str() == Some(&name)
-                })
-            })
-            .ok_or_else(|| format!("No suitable asset found for version v{}", version))?;
+        let platform = utils::platform_key();
 
-        let download_url = asset["browser_download_url"]
-            .as_str()
-            .ok_or_else(|| format!("Invalid asset download URL for version v{}", version))?;
+        let file = entry
+            .files
+            .get(&platform)
+            .ok_or_else(|| format!("No binary for platform: {}", platform))?;
+
+        let download_url = format!("{}v{}/{}", manifest.base, version_string, file);
 
         let download_response = client
-            .get(download_url)
+            .get(&download_url)
             .header("User-Agent", "mineplace3d-launcher")
             .send()
             .await
             .map_err(|e| format!("Failed to download asset: {}", e))?;
 
         if !download_response.status().is_success() {
-            return Err(format!("Failed to download asset for version v{}", version));
+            return Err(format!("Failed to download version v{}", version_string));
         }
 
         let exec_path = game_dir
             .join("versions")
             .join(if cfg!(target_os = "windows") {
-                format!("{}.exe", version)
+                format!("{}.exe", version_string)
             } else if cfg!(target_os = "macos") {
-                format!("{}.app", version)
+                format!("{}.app", version_string)
             } else {
-                version.to_string()
+                version_string.clone()
             });
 
         let total_size = download_response.content_length();
         let stream = download_response.bytes_stream();
 
-        download(total_size, stream, &mut progress_tx).await;
+        download_to_file(total_size, stream, exec_path.clone(), &mut progress_tx).await?;
 
         let _ = progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Finished));
 
@@ -435,7 +421,9 @@ impl Launcher {
                 let total_size = sdl2_response.content_length();
                 let stream = sdl2_response.bytes_stream();
 
-                download(total_size, stream, &mut progress_tx).await;
+                download_to_file(total_size, stream, temp_zip_path.clone(), &mut progress_tx)
+                    .await
+                    .map_err(|e| format!("Failed to download SDL2.dll: {}", e))?;
 
                 let _ =
                     progress_tx.try_send(Message::VersionDownloadUpdate(DownloadUpdate::Finished));
@@ -479,7 +467,7 @@ impl Launcher {
             })?;
         }
 
-        Ok(version)
+        Ok(version_string.parse().unwrap())
     }
 
     #[cfg(target_os = "linux")]
@@ -544,37 +532,32 @@ impl Launcher {
         match message {
             Message::Button(button_msg) => match button_msg {
                 ButtonMessage::DownloadVersion => {
-                    if let Ok(version) = self.input_version_content.parse() {
-                        if self.versions.contains(&version) {
+                    let version = match self.input_version_content.parse() {
+                        Ok(v) => Some(v),
+                        Err(_) if self.input_version_content.trim().is_empty() => None,
+                        Err(_) => {
+                            eprintln!("Invalid version format: {}", self.input_version_content);
                             return Task::none();
                         }
+                    };
 
-                        self.version_downloading = true;
+                    self.version_downloading = true;
 
-                        let game_dir = self.launcher_settings.game_dir.clone();
-                        if let Ok(version) = self.input_version_content.parse() {
-                            let sender = self
-                                .version_update_sender
-                                .clone()
-                                .expect("Download update sender not set");
+                    let game_dir = self.launcher_settings.game_dir.clone();
+                    let sender = self
+                        .version_update_sender
+                        .clone()
+                        .expect("Download update sender not set");
 
-                            let download_task = Task::perform(
-                                Self::download_version(game_dir, version, sender),
-                                |res| match res {
-                                    Ok(v) => Message::VersionDownloaded(v),
-                                    Err(e) => Message::VersionDownloadFailed(e),
-                                },
-                            );
+                    let download_task =
+                        Task::perform(Self::download_version(game_dir, version, sender), |res| {
+                            match res {
+                                Ok(v) => Message::VersionDownloaded(v),
+                                Err(e) => Message::VersionDownloadFailed(e),
+                            }
+                        });
 
-                            download_task
-                        } else {
-                            eprintln!("Invalid version format: {}", self.input_version_content);
-                            Task::none()
-                        }
-                    } else {
-                        eprintln!("Invalid version format: {}", self.input_version_content);
-                        Task::none()
-                    }
+                    download_task
                 }
                 ButtonMessage::RunVersion => {
                     if let Ok(version) = self.input_version_content.parse() {
@@ -740,7 +723,7 @@ impl Launcher {
         }
 
         let version_input = text_input(
-            "Enter version (e.g., 0.3.0-alpha.1)",
+            "Enter version (e.g. 0.1.2-beta or leave blank for latest)",
             &self.input_version_content,
         )
         .on_input(|value| Message::Input(InputMessage::VersionContentChanged(value)))
@@ -770,7 +753,7 @@ impl Launcher {
             }
         });
 
-        if !self.version_downloading && !self.input_version_content.is_empty() {
+        if !self.version_downloading {
             download_button =
                 download_button.on_press(Message::Button(ButtonMessage::DownloadVersion));
         }
@@ -779,6 +762,7 @@ impl Launcher {
             Ok(version) if self.versions.contains(&version) || self.version_downloading => {
                 download_button = download_button.on_press_maybe(None);
             }
+            Err(_) if self.input_version_content.trim().is_empty() => {}
             Err(_) => {
                 download_button = download_button.on_press_maybe(None);
             }
