@@ -54,11 +54,11 @@ impl PartialOrd for Version {
 
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.major
-            .cmp(&other.major)
+        self.stage
+            .cmp(&other.stage)
+            .then(self.major.cmp(&other.major))
             .then(self.minor.cmp(&other.minor))
             .then(self.patch.cmp(&other.patch))
-            .then(self.stage.cmp(&other.stage))
             .then(self.build.cmp(&other.build))
     }
 }
@@ -134,5 +134,18 @@ impl std::fmt::Display for Version {
             write!(f, ".{}", self.build)?;
         }
         Ok(())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Version {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl serde::Serialize for Version {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
     }
 }

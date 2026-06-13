@@ -3,6 +3,9 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::VersionChoice;
+use crate::version::Version;
+
 pub fn copy_dir(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -51,32 +54,41 @@ pub fn platform_key() -> String {
     format!("{os}_{arch}")
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub latest: Latest,
     pub base: String,
-    pub versions: HashMap<String, VersionEntry>,
+    pub versions: HashMap<Version, VersionEntry>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Latest {
-    pub beta: Option<String>,
-    pub alpha: Option<String>,
-    pub stable: Option<String>,
-}
+impl Manifest {
+    pub fn get_chosen_version(&self, choice: VersionChoice) -> Option<Version> {
+        match choice {
+            VersionChoice::Latest => self.get_latest_version(),
+            VersionChoice::Specific(v) => Some(v),
+        }
+    }
 
-impl Latest {
-    pub fn get_latest_version(&self) -> Option<&str> {
-        self.stable
+    pub fn get_latest_version(&self) -> Option<Version> {
+        self.latest
+            .stable
             .as_ref()
-            .or(self.beta.as_ref())
-            .or(self.alpha.as_ref())
-            .map(|v| v.as_str())
+            .or(self.latest.beta.as_ref())
+            .or(self.latest.alpha.as_ref())
+            .copied()
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct Latest {
+    pub beta: Option<Version>,
+    pub alpha: Option<Version>,
+    pub stable: Option<Version>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct VersionEntry {
-    pub uploaded_on: String,
     pub files: HashMap<String, String>,
+    pub uploaded_on: String,
+    pub real_name: Option<String>,
 }

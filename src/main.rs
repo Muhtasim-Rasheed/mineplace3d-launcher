@@ -16,6 +16,39 @@ use crate::version::Version;
 mod utils;
 mod version;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionChoice {
+    Latest,
+    Specific(Version),
+}
+
+impl PartialOrd for VersionChoice {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VersionChoice {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use VersionChoice::*;
+
+        match (self, other) {
+            (Latest, _) => std::cmp::Ordering::Greater,
+            (_, Latest) => std::cmp::Ordering::Less,
+            (Specific(v1), Specific(v2)) => v1.cmp(v2),
+        }
+    }
+}
+
+impl std::fmt::Display for VersionChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VersionChoice::Latest => write!(f, "latest"),
+            VersionChoice::Specific(v) => write!(f, "{}", v),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ButtonMessage {
     DownloadVersion,
@@ -28,14 +61,21 @@ enum ButtonMessage {
 
 #[derive(Debug, Clone)]
 enum InputMessage {
-    VersionContentChanged(String),
     GameDirContentChanged(String),
+}
+
+#[derive(Debug, Clone)]
+enum PickListMessage {
+    SelectedVersion(VersionChoice),
 }
 
 #[derive(Debug, Clone)]
 enum Message {
     Button(ButtonMessage),
     Input(InputMessage),
+    PickList(PickListMessage),
+    ManifestFetched(Manifest),
+    ManifestFetchFailed(String),
     VersionDownloaded(Version),
     VersionDownloadFailed(String),
     VersionDownloadUpdateReady(Sender<Message>),
@@ -104,8 +144,9 @@ enum View {
 
 struct Launcher {
     launcher_settings: LauncherSettings,
+    manifest: Option<Manifest>,
     versions: HashSet<Version>,
-    input_version_content: String,
+    chosen_version: VersionChoice,
     input_game_dir_content: String,
     version_downloading: bool,
     version_download_update: DownloadUpdate,
@@ -114,7 +155,7 @@ struct Launcher {
 }
 
 impl Launcher {
-    fn new() -> Self {
+    fn new() -> (Self, Task<Message>) {
         let launcher_settings_file = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("mineplace3d-launcher")
@@ -137,8 +178,9 @@ impl Launcher {
 
         let mut launcher = Self {
             launcher_settings,
+            manifest: None,
             versions: HashSet::new(),
-            input_version_content: String::new(),
+            chosen_version: VersionChoice::Latest,
             input_game_dir_content: game_dir.to_string_lossy().to_string(),
             version_downloading: false,
             version_download_update: DownloadUpdate::default(),
@@ -148,13 +190,31 @@ impl Launcher {
 
         launcher.load_versions();
 
-        launcher
+        (
+            launcher,
+            Task::perform(Self::fetch_manifest(), |m| match m {
+                Ok(m) => Message::ManifestFetched(m),
+                Err(e) => Message::ManifestFetchFailed(e),
+            }),
+        )
     }
 
     fn setup_folder_structure(game_dir: &PathBuf) {
         std::fs::create_dir_all(game_dir).expect("Failed to create game directory");
         std::fs::create_dir_all(game_dir.join("versions"))
             .expect("Failed to create versions directory");
+    }
+
+    async fn fetch_manifest() -> Result<Manifest, String> {
+        reqwest::Client::new()
+            .get("https://muhtasim-rasheed.github.io/mineplace3d/manifest.json")
+            .header("User-Agent", "mineplace3d-launcher")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
     }
 
     fn load_versions(&mut self) {
@@ -164,15 +224,22 @@ impl Launcher {
             .join("versions")
             .join("versions.json");
         if let Ok(versions_data) = std::fs::read_to_string(full_path) {
-            let versions: HashSet<String> =
+            let versions: HashSet<Version> =
                 serde_json::from_str(&versions_data).expect("Failed to parse versions data");
-            let versions_parsed: HashSet<Version> = versions
-                .into_iter()
-                .filter_map(|v_str| v_str.parse().ok())
-                .collect();
-            self.versions = versions_parsed;
+            self.versions = versions;
         } else {
             self.versions = HashSet::new();
+        }
+    }
+
+    fn get_latest_downloaded(&self) -> Option<Version> {
+        self.versions.iter().copied().max()
+    }
+
+    fn get_chosen_downloaded(&self) -> Option<Version> {
+        match self.chosen_version {
+            VersionChoice::Latest => self.get_latest_downloaded(),
+            VersionChoice::Specific(v) => Some(v),
         }
     }
 
@@ -241,8 +308,9 @@ impl Launcher {
     }
 
     async fn download_version(
+        manifest: Manifest,
         game_dir: PathBuf,
-        version: Option<Version>,
+        version: Version,
         mut progress_tx: Sender<Message>,
     ) -> Result<Version, String> {
         async fn download_to_file(
@@ -325,32 +393,12 @@ impl Launcher {
             Ok(())
         }
 
-        let manifest_url = "https://muhtasim-rasheed.github.io/mineplace3d/manifest.json";
-
         let client = reqwest::Client::new();
-
-        let manifest: Manifest = client
-            .get(manifest_url)
-            .header("User-Agent", "mineplace3d-launcher")
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
-            .json()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let version_string = match version {
-            Some(v) => Some(v.to_string()),
-            None => manifest.latest.get_latest_version().map(|v| v.to_string()),
-        }
-        .ok_or_else(|| {
-            "No version specified and no latest version found in manifest".to_string()
-        })?;
 
         let entry = manifest
             .versions
-            .get(&version_string)
-            .ok_or_else(|| format!("Version v{} not found in manifest", version_string))?;
+            .get(&version)
+            .ok_or_else(|| format!("Version v{} not found in manifest", version.to_string()))?;
 
         let platform = utils::platform_key();
 
@@ -359,7 +407,12 @@ impl Launcher {
             .get(&platform)
             .ok_or_else(|| format!("No binary for platform: {}", platform))?;
 
-        let download_url = format!("{}v{}/{}", manifest.base, version_string, file);
+        let download_url = format!(
+            "{}v{}/{}",
+            manifest.base,
+            entry.real_name.clone().unwrap_or(version.to_string()),
+            file
+        );
 
         let download_response = client
             .get(&download_url)
@@ -369,17 +422,20 @@ impl Launcher {
             .map_err(|e| format!("Failed to download asset: {}", e))?;
 
         if !download_response.status().is_success() {
-            return Err(format!("Failed to download version v{}", version_string));
+            return Err(format!(
+                "Failed to download version v{}",
+                version.to_string()
+            ));
         }
 
         let exec_path = game_dir
             .join("versions")
             .join(if cfg!(target_os = "windows") {
-                format!("{}.exe", version_string)
+                format!("{}.exe", version.to_string())
             } else if cfg!(target_os = "macos") {
-                format!("{}.app", version_string)
+                format!("{}.app", version.to_string())
             } else {
-                version_string.clone()
+                version.to_string().clone()
             });
 
         let total_size = download_response.content_length();
@@ -467,7 +523,7 @@ impl Launcher {
             })?;
         }
 
-        Ok(version_string.parse().unwrap())
+        Ok(version)
     }
 
     #[cfg(target_os = "linux")]
@@ -532,13 +588,14 @@ impl Launcher {
         match message {
             Message::Button(button_msg) => match button_msg {
                 ButtonMessage::DownloadVersion => {
-                    let version = match self.input_version_content.parse() {
-                        Ok(v) => Some(v),
-                        Err(_) if self.input_version_content.trim().is_empty() => None,
-                        Err(_) => {
-                            eprintln!("Invalid version format: {}", self.input_version_content);
-                            return Task::none();
-                        }
+                    let Some(manifest) = self.manifest.clone() else {
+                        eprintln!("Wait for the manifest to finish downloading");
+                        return Task::none();
+                    };
+
+                    let Some(version) = manifest.get_chosen_version(self.chosen_version) else {
+                        eprintln!("Invalid version {}", self.chosen_version);
+                        return Task::none();
                     };
 
                     self.version_downloading = true;
@@ -549,23 +606,27 @@ impl Launcher {
                         .clone()
                         .expect("Download update sender not set");
 
-                    let download_task =
-                        Task::perform(Self::download_version(game_dir, version, sender), |res| {
-                            match res {
-                                Ok(v) => Message::VersionDownloaded(v),
-                                Err(e) => Message::VersionDownloadFailed(e),
-                            }
-                        });
+                    let download_task = Task::perform(
+                        Self::download_version(manifest, game_dir, version, sender),
+                        |res| match res {
+                            Ok(v) => Message::VersionDownloaded(v),
+                            Err(e) => Message::VersionDownloadFailed(e),
+                        },
+                    );
 
                     download_task
                 }
                 ButtonMessage::RunVersion => {
-                    if let Ok(version) = self.input_version_content.parse() {
-                        self.run_version(version).unwrap_or_else(|e| {
-                            eprintln!("Error running version: {}", e);
-                        });
+                    if let Some(version) = self.get_chosen_downloaded() {
+                        if !self.versions.contains(&version) {
+                            eprintln!("You have not installed this version");
+                        } else {
+                            self.run_version(version).unwrap_or_else(|e| {
+                                eprintln!("Error running version: {}", e);
+                            });
+                        }
                     } else {
-                        eprintln!("Invalid version format: {}", self.input_version_content);
+                        eprintln!("You have no versions downloaded");
                     }
                     Task::none()
                 }
@@ -622,15 +683,24 @@ impl Launcher {
                 }
             },
             Message::Input(input_msg) => match input_msg {
-                InputMessage::VersionContentChanged(new) => {
-                    self.input_version_content = new;
-                    Task::none()
-                }
                 InputMessage::GameDirContentChanged(new) => {
                     self.input_game_dir_content = new;
                     Task::none()
                 }
             },
+            Message::PickList(pick_list_msg) => match pick_list_msg {
+                PickListMessage::SelectedVersion(new) => {
+                    self.chosen_version = new;
+                    Task::none()
+                }
+            },
+            Message::ManifestFetched(m) => {
+                self.manifest = Some(m);
+                Task::none()
+            }
+            Message::ManifestFetchFailed(e) => {
+                panic!("Could not get manifest: {}", e);
+            }
             Message::VersionDownloaded(version) => {
                 self.versions.insert(version);
                 self.version_downloading = false;
@@ -722,13 +792,21 @@ impl Launcher {
             dark = !dark;
         }
 
-        let version_input = text_input(
-            "Enter version (e.g. 0.1.2-beta or leave blank for latest)",
-            &self.input_version_content,
-        )
-        .on_input(|value| Message::Input(InputMessage::VersionContentChanged(value)))
+        let mut version_options: Vec<VersionChoice> = vec![VersionChoice::Latest];
+        if let Some(manifest) = self.manifest.as_ref() {
+            let mut versions = manifest
+                .versions
+                .iter()
+                .map(|(v, _)| VersionChoice::Specific(*v))
+                .collect::<Vec<VersionChoice>>();
+            versions.sort_by(|a, b| b.cmp(a));
+            version_options.extend_from_slice(&versions);
+        }
+        let version_picker = pick_list(version_options, Some(self.chosen_version), |c| {
+            Message::PickList(PickListMessage::SelectedVersion(c))
+        })
         .padding(10)
-        .size(20);
+        .text_size(20);
 
         let mut download_button = button(if self.version_downloading {
             "Downloading..."
@@ -753,25 +831,43 @@ impl Launcher {
             }
         });
 
-        if !self.version_downloading {
+        if !self.version_downloading && self.manifest.is_some() {
             download_button =
                 download_button.on_press(Message::Button(ButtonMessage::DownloadVersion));
         }
 
-        match self.input_version_content.parse::<Version>() {
-            Ok(version) if self.versions.contains(&version) || self.version_downloading => {
-                download_button = download_button.on_press_maybe(None);
-            }
-            Err(_) if self.input_version_content.trim().is_empty() => {}
-            Err(_) => {
-                download_button = download_button.on_press_maybe(None);
-            }
-            _ => {}
+        if let Some(manifest) = self.manifest.as_ref()
+            && let Some(chosen_version) = manifest.get_chosen_version(self.chosen_version)
+            && self.versions.contains(&chosen_version)
+        {
+            download_button = download_button.on_press_maybe(None);
         }
 
-        let run_button = button("Run Version")
+        let mut run_button = button("Run Version")
             .padding(10)
+            .style(|theme: &Theme, status: button::Status| {
+                let palette = theme.extended_palette();
+
+                match status {
+                    button::Status::Disabled => iced::widget::button::Style {
+                        background: Some(palette.warning.weak.color.into()),
+                        text_color: palette.warning.weak.text,
+                        ..iced::widget::button::Style::default()
+                    },
+                    _ => iced::widget::button::Style {
+                        background: Some(palette.primary.base.color.into()),
+                        text_color: palette.primary.base.text,
+                        ..iced::widget::button::Style::default()
+                    },
+                }
+            })
             .on_press(Message::Button(ButtonMessage::RunVersion));
+
+        if let Some(chosen_version) = self.get_chosen_downloaded()
+            && !self.versions.contains(&chosen_version)
+        {
+            run_button = run_button.on_press_maybe(None);
+        }
 
         let settings_button = button("Settings")
             .padding(10)
@@ -782,7 +878,7 @@ impl Launcher {
             text("Installed Versions:").size(20),
             installed_versions,
             text("Select Version:").size(20),
-            version_input,
+            version_picker,
             row![download_button, run_button, settings_button].spacing(10),
         ]
         .spacing(20)
