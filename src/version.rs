@@ -149,3 +149,36 @@ impl serde::Serialize for Version {
         serializer.serialize_str(&self.to_string())
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionChoice {
+    Latest,
+    Specific(Version),
+}
+
+impl PartialOrd for VersionChoice {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VersionChoice {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use VersionChoice::*;
+
+        match (self, other) {
+            (Latest, _) => std::cmp::Ordering::Greater,
+            (_, Latest) => std::cmp::Ordering::Less,
+            (Specific(v1), Specific(v2)) => v1.cmp(v2),
+        }
+    }
+}
+
+impl std::fmt::Display for VersionChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VersionChoice::Latest => write!(f, "latest"),
+            VersionChoice::Specific(v) => write!(f, "{}", v),
+        }
+    }
+}

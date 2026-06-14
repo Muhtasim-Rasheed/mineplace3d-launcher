@@ -62,6 +62,13 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    pub fn get_chosen_version_entry<'a>(
+        &'a self,
+        choice: VersionChoice,
+    ) -> Option<&'a VersionEntry> {
+        self.versions.get(&self.get_chosen_version(choice)?)
+    }
+
     pub fn get_chosen_version(&self, choice: VersionChoice) -> Option<Version> {
         match choice {
             VersionChoice::Latest => self.get_latest_version(),

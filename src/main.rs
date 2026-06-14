@@ -11,51 +11,17 @@ use serde::ser::SerializeStruct;
 use tokio::io::AsyncWriteExt;
 
 use crate::utils::{Manifest, bytes_to_human_readable, copy_dir};
-use crate::version::Version;
+use crate::version::{Version, VersionChoice};
 
 mod utils;
 mod version;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VersionChoice {
-    Latest,
-    Specific(Version),
-}
-
-impl PartialOrd for VersionChoice {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for VersionChoice {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use VersionChoice::*;
-
-        match (self, other) {
-            (Latest, _) => std::cmp::Ordering::Greater,
-            (_, Latest) => std::cmp::Ordering::Less,
-            (Specific(v1), Specific(v2)) => v1.cmp(v2),
-        }
-    }
-}
-
-impl std::fmt::Display for VersionChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            VersionChoice::Latest => write!(f, "latest"),
-            VersionChoice::Specific(v) => write!(f, "{}", v),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 enum ButtonMessage {
     DownloadVersion,
     RunVersion,
 
-    OpenSettings,
-    ExitSettings,
+    SwitchTab(View),
     SaveSettings,
 }
 
@@ -66,7 +32,8 @@ enum InputMessage {
 
 #[derive(Debug, Clone)]
 enum PickListMessage {
-    SelectedVersion(VersionChoice),
+    SelectedPlayingVersion(VersionChoice),
+    SelectedDownloadVersion(VersionChoice),
 }
 
 #[derive(Debug, Clone)]
@@ -137,16 +104,33 @@ impl<'de> serde::Deserialize<'de> for LauncherSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
-    Main,
+    Play,
+    Download,
     Settings,
+}
+
+impl View {
+    const ALL: [View; 3] = [View::Play, View::Download, View::Settings];
+}
+
+impl std::fmt::Display for View {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            View::Play => write!(f, "Play"),
+            View::Download => write!(f, "Download"),
+            View::Settings => write!(f, "Settings"),
+        }
+    }
 }
 
 struct Launcher {
     launcher_settings: LauncherSettings,
     manifest: Option<Manifest>,
     versions: HashSet<Version>,
-    chosen_version: VersionChoice,
+    chosen_playing_version: VersionChoice,
+    chosen_download_version: VersionChoice,
     input_game_dir_content: String,
     version_downloading: bool,
     version_download_update: DownloadUpdate,
@@ -180,12 +164,13 @@ impl Launcher {
             launcher_settings,
             manifest: None,
             versions: HashSet::new(),
-            chosen_version: VersionChoice::Latest,
+            chosen_playing_version: VersionChoice::Latest,
+            chosen_download_version: VersionChoice::Latest,
             input_game_dir_content: game_dir.to_string_lossy().to_string(),
             version_downloading: false,
             version_download_update: DownloadUpdate::default(),
             version_update_sender: None,
-            view: View::Main,
+            view: View::Play,
         };
 
         launcher.load_versions();
@@ -237,7 +222,7 @@ impl Launcher {
     }
 
     fn get_chosen_downloaded(&self) -> Option<Version> {
-        match self.chosen_version {
+        match self.chosen_playing_version {
             VersionChoice::Latest => self.get_latest_downloaded(),
             VersionChoice::Specific(v) => Some(v),
         }
@@ -398,7 +383,7 @@ impl Launcher {
         let entry = manifest
             .versions
             .get(&version)
-            .ok_or_else(|| format!("Version v{} not found in manifest", version.to_string()))?;
+            .ok_or_else(|| format!("Version v{} not found in manifest", version))?;
 
         let platform = utils::platform_key();
 
@@ -422,18 +407,15 @@ impl Launcher {
             .map_err(|e| format!("Failed to download asset: {}", e))?;
 
         if !download_response.status().is_success() {
-            return Err(format!(
-                "Failed to download version v{}",
-                version.to_string()
-            ));
+            return Err(format!("Failed to download version v{}", version));
         }
 
         let exec_path = game_dir
             .join("versions")
             .join(if cfg!(target_os = "windows") {
-                format!("{}.exe", version.to_string())
+                format!("{}.exe", version)
             } else if cfg!(target_os = "macos") {
-                format!("{}.app", version.to_string())
+                format!("{}.app", version)
             } else {
                 version.to_string().clone()
             });
@@ -593,8 +575,9 @@ impl Launcher {
                         return Task::none();
                     };
 
-                    let Some(version) = manifest.get_chosen_version(self.chosen_version) else {
-                        eprintln!("Invalid version {}", self.chosen_version);
+                    let Some(version) = manifest.get_chosen_version(self.chosen_download_version)
+                    else {
+                        eprintln!("Invalid version {}", self.chosen_download_version);
                         return Task::none();
                     };
 
@@ -606,15 +589,13 @@ impl Launcher {
                         .clone()
                         .expect("Download update sender not set");
 
-                    let download_task = Task::perform(
+                    Task::perform(
                         Self::download_version(manifest, game_dir, version, sender),
                         |res| match res {
                             Ok(v) => Message::VersionDownloaded(v),
                             Err(e) => Message::VersionDownloadFailed(e),
                         },
-                    );
-
-                    download_task
+                    )
                 }
                 ButtonMessage::RunVersion => {
                     if let Some(version) = self.get_chosen_downloaded() {
@@ -630,12 +611,8 @@ impl Launcher {
                     }
                     Task::none()
                 }
-                ButtonMessage::OpenSettings => {
-                    self.view = View::Settings;
-                    Task::none()
-                }
-                ButtonMessage::ExitSettings => {
-                    self.view = View::Main;
+                ButtonMessage::SwitchTab(new) => {
+                    self.view = new;
                     Task::none()
                 }
                 ButtonMessage::SaveSettings => {
@@ -667,7 +644,7 @@ impl Launcher {
                     std::fs::write(launcher_settings_file, settings_data)
                         .expect("Failed to write launcher settings file");
 
-                    self.view = View::Main;
+                    self.view = View::Play;
                     self.input_game_dir_content = self
                         .launcher_settings
                         .game_dir
@@ -689,8 +666,12 @@ impl Launcher {
                 }
             },
             Message::PickList(pick_list_msg) => match pick_list_msg {
-                PickListMessage::SelectedVersion(new) => {
-                    self.chosen_version = new;
+                PickListMessage::SelectedPlayingVersion(new) => {
+                    self.chosen_playing_version = new;
+                    Task::none()
+                }
+                PickListMessage::SelectedDownloadVersion(new) => {
+                    self.chosen_download_version = new;
                     Task::none()
                 }
             },
@@ -756,7 +737,7 @@ impl Launcher {
         }
     }
 
-    fn main_view(&self) -> iced::Element<'_, Message> {
+    fn play_view(&self) -> iced::Element<'_, Message> {
         let mut installed_versions = Column::new();
         let mut versions: Vec<Version> = self.versions.iter().copied().collect();
         versions.sort();
@@ -793,129 +774,126 @@ impl Launcher {
         }
 
         let mut version_options: Vec<VersionChoice> = vec![VersionChoice::Latest];
+        let mut versions = self
+            .versions
+            .iter()
+            .map(|v| VersionChoice::Specific(*v))
+            .collect::<Vec<VersionChoice>>();
+        versions.sort_by(|a, b| b.cmp(a));
+        version_options.extend_from_slice(&versions);
+        let version_picker = pick_list(version_options, Some(self.chosen_playing_version), |c| {
+            Message::PickList(PickListMessage::SelectedPlayingVersion(c))
+        })
+        .padding(10);
+        let version_row = row![text("Version: "), version_picker].align_y(iced::Alignment::Center);
+
+        let run_button = button(text("Run Version").width(iced::Fill).center())
+            .padding(10)
+            .width(iced::Fill)
+            .on_press(Message::Button(ButtonMessage::RunVersion));
+
+        let panel_info = column![text("Installed Versions:").size(20), installed_versions]
+            .spacing(10)
+            .width(iced::FillPortion(2));
+
+        let panel_play = column![version_row, space().height(iced::Fill), run_button]
+            .spacing(10)
+            .width(iced::FillPortion(1));
+
+        row![panel_info, rule::vertical(1), panel_play]
+            .spacing(20)
+            .into()
+    }
+
+    fn download_view(&self) -> iced::Element<'_, Message> {
+        let mut version_options: Vec<VersionChoice> = vec![VersionChoice::Latest];
         if let Some(manifest) = self.manifest.as_ref() {
             let mut versions = manifest
                 .versions
-                .iter()
-                .map(|(v, _)| VersionChoice::Specific(*v))
+                .keys()
+                .filter_map(|v| {
+                    (!self.versions.contains(&v)).then_some(VersionChoice::Specific(*v))
+                })
                 .collect::<Vec<VersionChoice>>();
             versions.sort_by(|a, b| b.cmp(a));
             version_options.extend_from_slice(&versions);
         }
-        let version_picker = pick_list(version_options, Some(self.chosen_version), |c| {
-            Message::PickList(PickListMessage::SelectedVersion(c))
+        let version_picker = pick_list(version_options, Some(self.chosen_download_version), |c| {
+            Message::PickList(PickListMessage::SelectedDownloadVersion(c))
         })
-        .padding(10)
-        .text_size(20);
+        .padding(10);
+        let version_row = row![text("Version: "), version_picker].align_y(iced::Alignment::Center);
 
-        let mut download_button = button(if self.version_downloading {
-            "Downloading..."
-        } else {
-            "Download Version"
-        })
+        let mut download_button = button(
+            text(if self.version_downloading {
+                "Downloading..."
+            } else {
+                "Download Version"
+            })
+            .width(iced::Fill)
+            .center(),
+        )
         .padding(10)
-        .style(|theme: &Theme, status: button::Status| {
-            let palette = theme.extended_palette();
-
-            match status {
-                button::Status::Disabled => iced::widget::button::Style {
-                    background: Some(palette.warning.weak.color.into()),
-                    text_color: palette.warning.weak.text,
-                    ..iced::widget::button::Style::default()
-                },
-                _ => iced::widget::button::Style {
-                    background: Some(palette.primary.base.color.into()),
-                    text_color: palette.primary.base.text,
-                    ..iced::widget::button::Style::default()
-                },
-            }
-        });
+        .width(iced::Fill);
 
         if !self.version_downloading && self.manifest.is_some() {
             download_button =
                 download_button.on_press(Message::Button(ButtonMessage::DownloadVersion));
         }
 
+        let panel_select = column![version_row, space().height(iced::Fill), download_button]
+            .spacing(10)
+            .width(iced::FillPortion(1));
+
+        let mut info = String::new();
         if let Some(manifest) = self.manifest.as_ref()
-            && let Some(chosen_version) = manifest.get_chosen_version(self.chosen_version)
-            && self.versions.contains(&chosen_version)
+            && let Some(ve) = manifest.get_chosen_version_entry(self.chosen_download_version)
         {
-            download_button = download_button.on_press_maybe(None);
+            use std::fmt::Write;
+            if let Ok(uploaded_on) = chrono::DateTime::parse_from_rfc3339(&ve.uploaded_on) {
+                writeln!(info, "Uploaded on: {}", uploaded_on.to_utc()).unwrap();
+            }
         }
+        let info = text(info);
 
-        let mut run_button = button("Run Version")
-            .padding(10)
-            .style(|theme: &Theme, status: button::Status| {
-                let palette = theme.extended_palette();
-
-                match status {
-                    button::Status::Disabled => iced::widget::button::Style {
-                        background: Some(palette.warning.weak.color.into()),
-                        text_color: palette.warning.weak.text,
-                        ..iced::widget::button::Style::default()
-                    },
-                    _ => iced::widget::button::Style {
-                        background: Some(palette.primary.base.color.into()),
-                        text_color: palette.primary.base.text,
-                        ..iced::widget::button::Style::default()
-                    },
-                }
-            })
-            .on_press(Message::Button(ButtonMessage::RunVersion));
-
-        if let Some(chosen_version) = self.get_chosen_downloaded()
-            && !self.versions.contains(&chosen_version)
-        {
-            run_button = run_button.on_press_maybe(None);
-        }
-
-        let settings_button = button("Settings")
-            .padding(10)
-            .on_press(Message::Button(ButtonMessage::OpenSettings));
-
-        let mut content = column![
-            text("Mineplace3D Launcher").size(30),
-            text("Installed Versions:").size(20),
-            installed_versions,
-            text("Select Version:").size(20),
-            version_picker,
-            row![download_button, run_button, settings_button].spacing(10),
-        ]
-        .spacing(20)
-        .padding(20);
+        let mut panel_download = column![info, space().height(iced::Fill)]
+            .spacing(10)
+            .width(iced::FillPortion(2));
 
         if let DownloadUpdate::Progress { progress, speed } = self.version_download_update {
             let progress_bar = iced::widget::progress_bar(0.0..=1.0, progress)
                 .length(iced::Length::Fill)
                 .girth(20);
-            content = content.push(progress_bar);
+            panel_download = panel_download.push(progress_bar);
             let progress_text = text(format!(
                 "Download Progress: {:.2}%, Speed: {}/s",
                 progress * 100.0,
                 bytes_to_human_readable(speed),
             ))
             .size(16);
-            content = content.push(progress_text);
+            panel_download = panel_download.push(progress_text);
         } else if let DownloadUpdate::Finished = self.version_download_update {
             let progress_bar = iced::widget::progress_bar(0.0..=1.0, 1.0)
                 .length(iced::Length::Fill)
                 .girth(20);
-            content = content.push(progress_bar);
+            panel_download = panel_download.push(progress_bar);
             let progress_text = text("Download Complete!").size(16);
-            content = content.push(progress_text);
+            panel_download = panel_download.push(progress_text);
         } else if let DownloadUpdate::Failed { last_progress } = self.version_download_update {
             if let Some(progress) = last_progress {
                 let progress_bar = iced::widget::progress_bar(0.0..=1.0, progress)
                     .length(iced::Length::Fill)
                     .girth(20)
                     .style(progress_bar::danger);
-                content = content.push(progress_bar);
+                panel_download = panel_download.push(progress_bar);
             }
             let progress_text = text("Download Failed!").size(16);
-            content = content.push(progress_text);
+            panel_download = panel_download.push(progress_text);
         }
 
-        container(content).center(iced::Fill).into()
+        row![panel_select, rule::vertical(1), panel_download]
+            .spacing(20)
+            .into()
     }
 
     fn settings_view(&self) -> iced::Element<'_, Message> {
@@ -928,15 +906,11 @@ impl Launcher {
             .padding(10)
             .on_press(Message::Button(ButtonMessage::SaveSettings));
 
-        let exit_button = button("Back")
-            .padding(10)
-            .on_press(Message::Button(ButtonMessage::ExitSettings));
-
-        let content = column![
+        column![
             text("Launcher Settings").size(30),
             text("Game Directory:").size(20),
             game_dir_input,
-            row![save_button, exit_button].spacing(10),
+            save_button,
             text("Advanced").size(30),
             text!(
                 "To manually change the game directory, edit the launcher_settings.json file located in {}.",
@@ -944,16 +918,46 @@ impl Launcher {
             ).size(16),
         ]
         .spacing(20)
-        .padding(20);
-
-        container(content).center(iced::Fill).into()
+        .padding(20)
+        .into()
     }
 
     fn view(&self) -> iced::Element<'_, Message> {
-        match self.view {
-            View::Main => self.main_view(),
-            View::Settings => self.settings_view(),
+        let mut tab_bar = row![].spacing(5);
+        for view in View::ALL {
+            let btn = button(text(format!("{}", view)).center())
+                .width(100)
+                .padding(5)
+                .style(|theme: &Theme, status: button::Status| {
+                    let palette = theme.extended_palette();
+
+                    match status {
+                        button::Status::Disabled => iced::widget::button::Style {
+                            background: Some(palette.secondary.weak.color.into()),
+                            text_color: palette.secondary.weak.text,
+                            ..iced::widget::button::Style::default()
+                        },
+                        _ => iced::widget::button::Style {
+                            background: Some(palette.primary.base.color.into()),
+                            text_color: palette.primary.base.text,
+                            ..iced::widget::button::Style::default()
+                        },
+                    }
+                })
+                .on_press_maybe(
+                    (view != self.view).then_some(Message::Button(ButtonMessage::SwitchTab(view))),
+                );
+            tab_bar = tab_bar.push(btn);
         }
+        let content = match self.view {
+            View::Play => self.play_view(),
+            View::Download => self.download_view(),
+            View::Settings => self.settings_view(),
+        };
+        column![tab_bar, rule::horizontal(1), content]
+            .spacing(20)
+            .padding(20)
+            .into()
     }
 }
 
@@ -963,6 +967,6 @@ fn main() -> iced::Result {
         .default_font(iced::Font::MONOSPACE)
         .title("Mineplace3D Launcher")
         .subscription(Launcher::subscription)
-        .window_size((600, 800))
+        .window_size((1280, 720))
         .run()
 }
