@@ -962,6 +962,10 @@ impl Launcher {
 }
 
 fn main() -> iced::Result {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap();
+
     iced::application(Launcher::new, Launcher::update, Launcher::view)
         .theme(iced::theme::Theme::CatppuccinMocha)
         .default_font(iced::Font::MONOSPACE)
